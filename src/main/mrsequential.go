@@ -28,7 +28,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	mapf, reducef := LoadPlugin(os.Args[1])
+	mapf, reducef := loadPlugin(os.Args[1])
 
 	//
 	// read each input file,

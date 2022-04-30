@@ -52,4 +52,5 @@ go run -race mrsequential.go wc.so pg*.txt
 这个项目中`MapReduce`的大体思路是，`worker`向`coordinator`申请任务，先做`map`任务，当所有`map`任务完成之后才可以做`reduce`任务。
 `map`任务的结果通过哈希将其分配到固定数量(`nReduce`)的桶中，`reduce`任务处理对应桶中的信息。最后将多个`reduce`的输出结合到一起便完成了任务。
 
-这里我想到
+论文阅读笔记：https://spongecaptain.cool/post/paper/mapreduce/
+

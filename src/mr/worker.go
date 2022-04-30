@@ -146,7 +146,9 @@ func Worker(mapf func(string, string) []KeyValue,
 					intermediate = append(intermediate, kv)
 				}
 				_ = infile.Close()
-				_ = os.Remove(inname)
+
+				// P1: 错误示范，因为reduce任务可能会失败，之后要重新执行，因此不能在这里早早删除。
+				// _ = os.Remove(inname)
 			}
 
 			sort.Sort(ByKey(intermediate))
@@ -180,6 +182,12 @@ func Worker(mapf func(string, string) []KeyValue,
 			argsFinish := TaskFinishedArgs{TaskNum: reply.TaskNum + reply.NMap}
 			replyFinish := TaskFinishedReply{}
 			ok = call("Coordinator.TaskFinished", &argsFinish, &replyFinish)
+
+			// P1: 清理文件
+			for i := 0; i < reply.NMap; i++ {
+				inname := "mr" + fmt.Sprintf("-%v", i) + fmt.Sprintf("-%v", reply.TaskNum)
+				_ = os.Remove(inname)
+			}
 		}
 		//time.Sleep(time.Second)
 	}

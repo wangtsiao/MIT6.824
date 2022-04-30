@@ -141,7 +141,7 @@ func (c *Coordinator) TaskFinished(args *TaskFinishedArgs, reply *TaskFinishedRe
 	}
 	task.state = completedState
 	if task.taskType == mapTaskType {
-		log.Printf("task type %v, number %v completed, c.cntCompletedMap++\n", task.taskType, task.taskNum)
+		log.Printf("task type MapTask, number %v completed, c.cntCompletedMap++\n", task.taskNum)
 		c.cntCompleteMap += 1
 		if c.cntCompleteMap == c.nMap {
 			fmt.Println("all map task are done, starting reduce task...")
@@ -155,6 +155,7 @@ func (c *Coordinator) TaskFinished(args *TaskFinishedArgs, reply *TaskFinishedRe
 			}
 		}
 	} else {
+		log.Printf("task type ReduceTask, number %v completed, c.cntCompletedMap++\n", task.taskNum)
 		c.cntCompleteReduce += 1
 	}
 	return nil

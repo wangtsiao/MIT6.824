@@ -2,10 +2,27 @@
 
 ### 1. MapReduce
 
+MapReduce是非常有影响力的一篇论文，发表于2004年，它第一次向人们传达了计算可扩展性这个概念，即通过增加机器来处理大规模数据的任务。具体而言，一次任务在MapReduce中的处理流程主要分成两个阶段：Map - Patition - Reduce。下面通过两个例子简单传达MapReduce的技术思想。
+
+- 对一个大文件中关键词计数。首先把大文件分割，之后多个Map进程并行的在每个文件中，按照关键词的哈希将其分到不同位置，之后Reduce对其进行处理，合并得到最终结果。
+- 全排序。要把一亿个处于$[0,2^{64})$区间的数字按照大小排序，多个Map进程并行的将数字按照大小Patition到不同的位置，例如$[0,2^{16})$、$[2^{16},2^{17})$、对应不同的Reduce任务，之后每个Reduce将它们排序，最后合并起来得到结果。
+
+在上面两个例子中，如果修改一部分数据，哪怕一点点数据，都需要重新执行整个MapReduce过程来更新结果，处理搜索引擎爬虫的增量更新，不免捉襟见肘。后面会介绍Percolator，是Google的一个增量更新的数据库。
+
 ### 2. Google File System
 
 
-### 3. Fault-Tolerance Virtual Machine
+
+
+
+### 3. BigTable
+
+
+
+
+
+
+### 4. Fault-Tolerance Virtual Machine
 
 VMware公司在2010年发表的企业级（enterprise-grade）容错虚拟机。
 

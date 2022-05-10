@@ -112,20 +112,60 @@ func (rf *Raft) UnLock() {
 }
 
 func (rf *Raft) ResetPeriodTimer() {
+	// not concurrently secure
+	if !rf.periodTimer.Stop() {
+		select {
+		case <-rf.periodTimer.C:
+		default:
+		}
+	}
 	d := rand.Int()%ElectionTimeout + ElectionTimeout
 	rf.periodTimer.Reset(time.Duration(d) * time.Millisecond)
-	log.Printf("[Timer %v] reset period timer to %v.\n", rf.me, d)
+	log.Printf("[Term %v]: [Node %v][Role %v] call ResetPeriodTimer to %v ms.\n", rf.currentTerm, rf.me, rf.role, d)
+}
+
+func (rf *Raft) callToRequestVote(server, currentTerm, me, lastLogIndex, lastLogTerm int) bool {
+
+	rf.Lock()
+	log.Printf("[Term %v]: [Node %v][Role %v] call RequestVote rpc to Node %v.\n", currentTerm, me, rf.role, server)
+	rf.UnLock()
+
+	args := RequestVoteArgs{
+		Term:         currentTerm,
+		CandidateId:  me,
+		LastLogIndex: lastLogIndex,
+		LastLogTerm:  lastLogTerm,
+	}
+	reply := RequestVoteReply{}
+	ok := rf.sendRequestVote(server, &args, &reply)
+	if ok {
+		rf.Lock()
+		if reply.Term > rf.currentTerm {
+
+			log.Printf("[Term %v]: [Node %v][Role %v] found newer term %v > %v. turn to follower\n",
+				rf.currentTerm, rf.me, rf.role, reply.Term, rf.currentTerm)
+			rf.role = Follower
+			rf.votedFor = None
+			rf.currentTerm = reply.Term
+
+		}
+		rf.UnLock()
+	}
+	return reply.VoteGranted
 }
 
 func (rf *Raft) TurnToCandidate() {
 	rf.Lock()
+	log.Printf("[Term %v]: [Node %v][Role %v] turn to Candidate.\n", rf.currentTerm, rf.me, rf.role)
 	if rf.role != Follower {
-		log.Panicf("[Election %d] role should be follower when turn to candidate.\n", rf.me)
+		log.Panicf("[Node %d] role should be follower when turn to candidate.\n", rf.me)
 	}
 	rf.role = Candidate
 	rf.currentTerm += 1
 	rf.votedFor = rf.me
 	rf.ResetPeriodTimer()
+	lastLogIndex := len(rf.log) - 1
+	lastLogTerm := rf.log[lastLogIndex].Term
 	rf.UnLock()
 
 	grantedCount := 1
@@ -134,14 +174,8 @@ func (rf *Raft) TurnToCandidate() {
 	for i := 0; i < rf.nPeers; i++ {
 		if i != rf.me {
 			go func(server int) {
-				args := RequestVoteArgs{}
-				reply := RequestVoteReply{}
-				for {
-					ok := rf.sendRequestVote(server, &args, &reply)
-					if ok {
-						voteCh <- reply.VoteGranted
-					}
-				}
+				isGranted := rf.callToRequestVote(server, rf.currentTerm, rf.me, lastLogIndex, lastLogTerm)
+				voteCh <- isGranted
 			}(i)
 		}
 	}
@@ -156,64 +190,96 @@ func (rf *Raft) TurnToCandidate() {
 
 	if grantedCount >= rf.nPeers/2+1 {
 		rf.TurnToLeader()
-		log.Printf("[Election %d] receive %d granted vote, turn to leader.\n", rf.me, grantedCount)
 	} else {
-		rf.TurnToFollower()
-		log.Printf("[Election %d] receive %d granted vote, not enough, turn to follower.\n", rf.me, grantedCount)
+		rf.Lock()
+		log.Printf("[Term %v]: [Node %v][Role %v] got %d granted, not enough, turn to follower.\n",
+			rf.currentTerm, rf.me, rf.role, grantedCount)
+		rf.role = Follower
+		rf.votedFor = None
+		rf.UnLock()
 	}
 }
 
-func (rf *Raft) TurnToFollower() {
-	// TODO
-	if rf.role == Candidate {
-		rf.role = Follower
-		rf.ResetPeriodTimer()
-		rf.votedFor = None
-	}
-	if rf.role == Leader {
-		rf.role = Follower
-		rf.ResetPeriodTimer()
-	}
+func (rf *Raft) callToAppendEntries(server, currentTerm, me, preLogIndex, preLogTerm, commitIndex int, entries []Entry) bool {
 
+	rf.Lock()
+	log.Printf("[Term %v]: [Node %v][Role %v] call AppendEntries rpc to Node %v.\n", currentTerm, me, rf.role, server)
+	rf.UnLock()
+
+	args := AppendEntriesArgs{
+		Term:         currentTerm,
+		LeaderId:     me,
+		PrevLogIndex: preLogIndex,
+		PrevLogTerm:  preLogTerm,
+		Entries:      entries,
+		LeaderCommit: commitIndex,
+	}
+	reply := AppendEntriesReply{}
+	ok := rf.sendAppendEntries(server, &args, &reply)
+	if ok {
+		rf.Lock()
+		if reply.Term > rf.currentTerm {
+			log.Printf("[Term %v]: [Node %v][Role %v] found newer term %v > %v. turn to follower\n",
+				rf.currentTerm, rf.me, rf.role, reply.Term, rf.currentTerm)
+			rf.role = Follower
+			rf.votedFor = None
+			rf.currentTerm = reply.Term
+		}
+		rf.UnLock()
+	}
+	return reply.Success
+}
+
+func (rf *Raft) goLeaderHeartbeat() {
+	for {
+
+		rf.Lock()
+		if rf.role != Leader || rf.killed() {
+			rf.votedFor = None
+			rf.role = Follower
+			rf.UnLock()
+			break
+		}
+		rf.ResetPeriodTimer()
+		rf.UnLock()
+
+		for i := 0; i < rf.nPeers; i++ {
+			if i != rf.me {
+				go func(server int) {
+
+					rf.Lock()
+					preLogIndex := rf.nextIndex[server] - 1
+					preLogTerm := rf.log[preLogIndex].Term
+					commitIndex := rf.commitIndex
+					currentTerm := rf.currentTerm
+					rf.UnLock()
+
+					rf.callToAppendEntries(server, currentTerm, rf.me, preLogIndex, preLogTerm, commitIndex, nil)
+
+				}(i)
+			}
+		}
+
+		time.Sleep(time.Duration(HeartbeatTimeout) * time.Millisecond)
+
+	}
 }
 
 func (rf *Raft) TurnToLeader() {
 	rf.Lock()
-	defer rf.UnLock()
+	log.Printf("[Term %v]: [Node %v][Role %v] turn to Leader.\n", rf.currentTerm, rf.me, rf.role)
 	if rf.role != Candidate {
-		log.Panicf("[Election %d] role should be Candidate when turn to leader.\n", rf.me)
+		log.Panicf("[Node %d] role should be Candidate when turn to leader.\n", rf.me)
 	}
 	rf.role = Leader
 	for i := 0; i < rf.nPeers; i++ {
 		rf.nextIndex[i] = len(rf.log)
 		rf.matchIndex[i] = 0
 	}
+	rf.UnLock()
 
-	heartbeatTimer := time.NewTimer(time.Duration(HeartbeatTimeout) * time.Millisecond)
-	for rf.role == Leader {
-		for i := 0; i < rf.nPeers; i++ {
-			if i != rf.me {
-				go func(server int) {
-					preLogIndex := rf.nextIndex[server] - 1
-					preLogTerm := rf.log[preLogIndex].Term
-					args := AppendEntriesArgs{
-						Term:         rf.currentTerm,
-						LeaderId:     rf.me,
-						PrevLogIndex: preLogIndex,
-						PrevLogTerm:  preLogTerm,
-						Entries:      nil,
-						LeaderCommit: rf.commitIndex,
-					}
-					reply := AppendEntriesReply{}
-					ok := rf.sendAppendEntries(server, &args, &reply)
-					for !ok {
-						ok = rf.sendAppendEntries(server, &args, &reply)
-					}
-				}(i)
-			}
-		}
-		<-heartbeatTimer.C
-	}
+	go rf.goLeaderHeartbeat()
+
 }
 
 // return currentTerm and whether this server
@@ -269,7 +335,13 @@ func (rf *Raft) persist() {
 // restore previously persisted state.
 //
 func (rf *Raft) readPersist(data []byte) {
+	rf.Lock()
+	defer rf.UnLock()
+
 	if data == nil || len(data) < 1 { // bootstrap without any state?
+		rf.currentTerm = 0
+		rf.votedFor = None
+		rf.log = make(map[int]Entry)
 		return
 	}
 	// Your code here (2C).
@@ -285,8 +357,6 @@ func (rf *Raft) readPersist(data []byte) {
 	//   rf.xxx = xxx
 	//   rf.yyy = yyy
 	// }
-	rf.Lock()
-	defer rf.UnLock()
 	var err error
 	r := bytes.NewBuffer(data)
 	d := labgob.NewDecoder(r)
@@ -359,10 +429,20 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 		reply.VoteGranted = false
 		rf.votedFor = None
-		log.Printf("[Vote %v] receive request from %v, but term is older %v < %v, refuse it.\n",
-			rf.me, args.CandidateId, args.Term, rf.currentTerm)
+		log.Printf("[Term %v]: [Node %v][Role %v] receive request from %v, but term is older %v < %v, refuse it.\n",
+			rf.currentTerm, rf.me, rf.role, args.CandidateId, args.Term, rf.currentTerm)
 
 	} else {
+
+		if args.Term > rf.currentTerm {
+
+			log.Printf("[Term %v]: [Node %v][Role %v] receive request from %v, turn to follower because seen new term %v > %v.\n",
+				rf.currentTerm, rf.me, rf.role, args.CandidateId, args.Term, rf.currentTerm)
+			rf.currentTerm = args.Term
+			rf.role = Follower
+			rf.votedFor = None
+
+		}
 
 		lastLogIndex := len(rf.log) - 1
 		lastLogTerm := rf.log[lastLogIndex].Term
@@ -371,13 +451,17 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 			rf.votedFor = args.CandidateId
 			reply.VoteGranted = true
-			log.Printf("[Vote %v] receive request from %v, vote to it.\n", rf.me, args.CandidateId)
+			log.Printf("[Term %v]: [Node %v][Role %v] receive request from %v, vote to it.\n",
+				rf.currentTerm, rf.me, rf.role, args.CandidateId)
+			rf.ResetPeriodTimer()
 
 		} else {
 			reply.VoteGranted = false
-			log.Printf("[Vote %v] receive request from %v, already vote or not up-to-date, refuse it.\n",
-				rf.me, args.CandidateId)
+			log.Printf("[Term %v]: [Node %v][Role %v] receive request from %v, already vote or not up-to-date, "+
+				"(lastLogIndex, lastLogTerm) = (%v, %v) vs (%v, %v), votedFor is %v refuse it.\n",
+				rf.currentTerm, rf.me, rf.role, args.CandidateId, lastLogIndex, lastLogTerm, args.LastLogIndex, args.LastLogTerm, rf.votedFor)
 		}
+
 	}
 	reply.Term = rf.currentTerm
 }
@@ -403,39 +487,54 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if args.Term < rf.currentTerm {
 
 		reply.Success = false
-		log.Printf("[AppendEntries %v] receive request from %v, but term is older %v < %v, refuse it.\n",
-			rf.me, args.LeaderId, args.Term, rf.currentTerm)
-
-	} else if rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
-
-		reply.Success = false
-		log.Printf("[AppendEntries %v] receive request from %v, but prevLogTerm %v unequal args.prevLogTerm %v, refuse it.\n",
-			rf.me, args.LeaderId, rf.log[args.PrevLogIndex].Term, args.PrevLogTerm)
+		log.Printf("[Term %v]: [Node %v][Role %v] receive request from %v, but term is older %v < %v, refuse it.\n",
+			rf.currentTerm, rf.me, rf.role, args.LeaderId, args.Term, rf.currentTerm)
 
 	} else {
-		idx := args.PrevLogIndex + 1
-		if rf.log[idx].Term != args.Term {
-			log.Printf("[AppendEntries %v] receive request from %v, idx %v term %v unequal args.Term %v, delete all following.\n",
-				rf.me, args.LeaderId, idx, rf.log[idx].Term, args.Term)
-			idxRight := len(rf.log)
-			for ; idx < idxRight; idx += 1 {
-				delete(rf.log, idx)
+
+		if args.Term > rf.currentTerm {
+			log.Printf("[Term %v]: [Node %v][Role %v] receive request from %v, turn to follower because seen new term %v > %v.\n",
+				rf.currentTerm, rf.me, rf.role, args.LeaderId, args.Term, rf.currentTerm)
+			rf.currentTerm = args.Term
+			rf.role = Follower
+			rf.votedFor = None
+		}
+
+		if rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+
+			reply.Success = false
+			log.Printf("[Term %v]: [Node %v][Role %v] receive request from %v, but preLogIndex %v prevLogTerm %v unequal args.prevLogTerm %v, refuse it.\n",
+				rf.currentTerm, rf.me, rf.role, args.LeaderId, args.PrevLogIndex, rf.log[args.PrevLogIndex].Term, args.PrevLogTerm)
+
+		} else {
+
+			idx := args.PrevLogIndex + 1
+			if _, ok := rf.log[idx]; ok && rf.log[idx].Term != args.Term {
+				log.Printf("[Term %v]: [Node %v][Role %v] receive request from %v, idx %v term %v unequal args.Term %v, delete all following.\n",
+					rf.currentTerm, rf.me, rf.role, args.LeaderId, idx, rf.log[idx].Term, args.Term)
+				idxRight := len(rf.log)
+				for ; idx < idxRight; idx += 1 {
+					delete(rf.log, idx)
+				}
 			}
-		}
-		idx = args.PrevLogIndex
-		for _, entry := range args.Entries {
-			idx += 1
-			rf.log[idx] = entry
-		}
-		if args.LeaderCommit > rf.commitIndex {
-			if args.LeaderCommit < idx {
-				rf.commitIndex = args.LeaderCommit
-			} else {
-				rf.commitIndex = idx
+			idx = args.PrevLogIndex
+			for _, entry := range args.Entries {
+				idx += 1
+				rf.log[idx] = entry
 			}
+			if args.LeaderCommit > rf.commitIndex {
+				if args.LeaderCommit < idx {
+					rf.commitIndex = args.LeaderCommit
+				} else {
+					rf.commitIndex = idx
+				}
+			}
+			reply.Success = true
+			log.Printf("[Term %v]: [Node %v][Role %v] receive request from %v, reset timer.\n",
+				rf.currentTerm, rf.me, rf.role, args.LeaderId)
+			rf.ResetPeriodTimer()
+
 		}
-		reply.Success = true
-		rf.ResetPeriodTimer()
 	}
 	reply.Term = rf.currentTerm
 }
@@ -560,6 +659,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.applyCh = applyCh
 
 	rf.nPeers = len(peers)
+	log.Printf("[Init %v] set nPeers to %v.\n", rf.me, rf.nPeers)
+
 	rf.commitIndex = 0
 	rf.lastApplied = 0
 	rf.nextIndex = make([]int, rf.nPeers)
@@ -572,11 +673,13 @@ func Make(peers []*labrpc.ClientEnd, me int,
 		Command: nil,
 		Term:    0,
 	}
+	rf.role = Follower
 
-	rand.Seed(time.Now().Unix())
+	rand.Seed(time.Now().UnixNano())
 	d := rand.Int()%ElectionTimeout + ElectionTimeout
 	rf.periodTimer = time.NewTimer(time.Duration(d) * time.Millisecond)
 
+	log.Printf("[Init %v] set period timer to %v.\n", rf.me, d)
 	// start ticker goroutine to start elections
 	go rf.ticker()
 

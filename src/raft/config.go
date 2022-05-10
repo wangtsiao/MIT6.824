@@ -22,6 +22,7 @@ import "math/big"
 import "encoding/base64"
 import "time"
 import "fmt"
+import "os"
 
 func randstring(n int) string {
 	b := make([]byte, 2*n)
@@ -63,6 +64,14 @@ type config struct {
 var ncpu_once sync.Once
 
 func make_config(t *testing.T, n int, unreliable bool, snapshot bool) *config {
+
+	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
+	logFile, err := os.OpenFile("/dev/null", os.O_APPEND, 0666)
+	if err != nil {
+		log.Fatalf("[Debug] open /dev/null file failed.")
+	}
+	log.SetOutput(logFile)
+
 	ncpu_once.Do(func() {
 		if runtime.NumCPU() < 2 {
 			fmt.Printf("warning: only one CPU, which may conceal locking bugs\n")
@@ -377,6 +386,9 @@ func (cfg *config) connect(i int) {
 			cfg.net.Enable(endname, true)
 		}
 	}
+
+	log.Printf("[Debug] connect %v.\n", i)
+
 }
 
 // detach server i from the net.
@@ -400,6 +412,8 @@ func (cfg *config) disconnect(i int) {
 			cfg.net.Enable(endname, false)
 		}
 	}
+
+	log.Printf("[Debug] disconnect %v.\n", i)
 }
 
 func (cfg *config) rpcCount(server int) int {

@@ -36,6 +36,7 @@ const (
 	None             int = -1
 	ElectionTimeout  int = 150
 	HeartbeatTimeout int = 50
+	ApplyTimeout     int = 10
 	Follower         int = 1
 	Candidate        int = 2
 	Leader           int = 3
@@ -100,7 +101,8 @@ type Raft struct {
 	matchIndex []int
 
 	// Time count for heartbeat or election
-	periodTimer *time.Timer
+	electTimer *time.Timer
+	heartTimer *time.Timer
 }
 
 func (rf *Raft) Lock() {
@@ -111,47 +113,46 @@ func (rf *Raft) UnLock() {
 	rf.mu.Unlock()
 }
 
-func (rf *Raft) ResetPeriodTimer() {
+func (rf *Raft) ResetHeartTimer() {
 	// not concurrently secure
-	if !rf.periodTimer.Stop() {
+	if !rf.heartTimer.Stop() {
 		select {
-		case <-rf.periodTimer.C:
+		case <-rf.heartTimer.C:
+		default:
+		}
+	}
+	rf.heartTimer.Reset(time.Duration(HeartbeatTimeout) * time.Millisecond)
+	log.Printf("[Term %v]: [Node %v][Role %v] call ResetHeartTimer to %v ms.\n", rf.currentTerm, rf.me, rf.role, HeartbeatTimeout)
+}
+
+func (rf *Raft) ResetElectTimer() {
+	// not concurrently secure
+	if !rf.electTimer.Stop() {
+		select {
+		case <-rf.electTimer.C:
 		default:
 		}
 	}
 	d := rand.Int()%ElectionTimeout + ElectionTimeout
-	rf.periodTimer.Reset(time.Duration(d) * time.Millisecond)
-	log.Printf("[Term %v]: [Node %v][Role %v] call ResetPeriodTimer to %v ms.\n", rf.currentTerm, rf.me, rf.role, d)
+	rf.electTimer.Reset(time.Duration(d) * time.Millisecond)
+	log.Printf("[Term %v]: [Node %v][Role %v] call ResetElectTimer to %v ms.\n", rf.currentTerm, rf.me, rf.role, d)
 }
 
-func (rf *Raft) callToRequestVote(server, currentTerm, me, lastLogIndex, lastLogTerm int) bool {
-
+func (rf *Raft) TurnToLeader() {
 	rf.Lock()
-	log.Printf("[Term %v]: [Node %v][Role %v] call RequestVote rpc to Node %v.\n", currentTerm, me, rf.role, server)
+	log.Printf("[Term %v]: [Node %v][Role %v] turn to Leader.\n", rf.currentTerm, rf.me, rf.role)
+	if rf.role != Candidate {
+		log.Panicf("[Node %d] role should be Candidate when turn to leader.\n", rf.me)
+	}
+	rf.role = Leader
+	for i := 0; i < rf.nPeers; i++ {
+		rf.nextIndex[i] = len(rf.log)
+		rf.matchIndex[i] = 0
+	}
 	rf.UnLock()
 
-	args := RequestVoteArgs{
-		Term:         currentTerm,
-		CandidateId:  me,
-		LastLogIndex: lastLogIndex,
-		LastLogTerm:  lastLogTerm,
-	}
-	reply := RequestVoteReply{}
-	ok := rf.sendRequestVote(server, &args, &reply)
-	if ok {
-		rf.Lock()
-		if reply.Term > rf.currentTerm {
+	go rf.heartLoop()
 
-			log.Printf("[Term %v]: [Node %v][Role %v] found newer term %v > %v. turn to follower\n",
-				rf.currentTerm, rf.me, rf.role, reply.Term, rf.currentTerm)
-			rf.role = Follower
-			rf.votedFor = None
-			rf.currentTerm = reply.Term
-
-		}
-		rf.UnLock()
-	}
-	return reply.VoteGranted
 }
 
 func (rf *Raft) TurnToCandidate() {
@@ -163,7 +164,7 @@ func (rf *Raft) TurnToCandidate() {
 	rf.role = Candidate
 	rf.currentTerm += 1
 	rf.votedFor = rf.me
-	rf.ResetPeriodTimer()
+	rf.ResetElectTimer()
 	lastLogIndex := len(rf.log) - 1
 	lastLogTerm := rf.log[lastLogIndex].Term
 	rf.UnLock()
@@ -200,6 +201,38 @@ func (rf *Raft) TurnToCandidate() {
 	}
 }
 
+func (rf *Raft) callToRequestVote(server, currentTerm, me, lastLogIndex, lastLogTerm int) bool {
+
+	rf.Lock()
+	log.Printf("[Term %v]: [Node %v][Role %v] call RequestVote rpc to Node %v.\n", currentTerm, me, rf.role, server)
+	rf.UnLock()
+
+	args := RequestVoteArgs{
+		Term:         currentTerm,
+		CandidateId:  me,
+		LastLogIndex: lastLogIndex,
+		LastLogTerm:  lastLogTerm,
+	}
+	reply := RequestVoteReply{}
+
+	ok := rf.sendRequestVote(server, &args, &reply)
+	if ok {
+		rf.Lock()
+		if reply.Term > rf.currentTerm {
+
+			log.Printf("[Term %v]: [Node %v][Role %v] found newer term %v > %v. turn to follower\n",
+				rf.currentTerm, rf.me, rf.role, reply.Term, rf.currentTerm)
+			rf.role = Follower
+			rf.votedFor = None
+			rf.currentTerm = reply.Term
+
+		}
+		rf.UnLock()
+	}
+
+	return reply.VoteGranted
+}
+
 func (rf *Raft) callToAppendEntries(server, currentTerm, me, preLogIndex, preLogTerm, commitIndex int, entries []Entry) bool {
 
 	rf.Lock()
@@ -215,6 +248,7 @@ func (rf *Raft) callToAppendEntries(server, currentTerm, me, preLogIndex, preLog
 		LeaderCommit: commitIndex,
 	}
 	reply := AppendEntriesReply{}
+
 	ok := rf.sendAppendEntries(server, &args, &reply)
 	if ok {
 		rf.Lock()
@@ -225,12 +259,23 @@ func (rf *Raft) callToAppendEntries(server, currentTerm, me, preLogIndex, preLog
 			rf.votedFor = None
 			rf.currentTerm = reply.Term
 		}
+		if reply.Success {
+			rf.matchIndex[server] = args.PrevLogIndex + len(entries)
+			rf.nextIndex[server] = rf.matchIndex[server] + 1
+		} else {
+			preIndex := args.PrevLogIndex
+			for rf.log[preIndex].Term == args.PrevLogTerm && rf.nextIndex[server] >= 1 {
+				rf.nextIndex[server]--
+				preIndex = rf.nextIndex[server] - 1
+			}
+		}
 		rf.UnLock()
 	}
+
 	return reply.Success
 }
 
-func (rf *Raft) goLeaderHeartbeat() {
+func (rf *Raft) heartLoop() {
 	for {
 
 		rf.Lock()
@@ -240,7 +285,17 @@ func (rf *Raft) goLeaderHeartbeat() {
 			rf.UnLock()
 			break
 		}
-		rf.ResetPeriodTimer()
+		rf.ResetElectTimer()
+		rf.UnLock()
+
+		rf.Lock()
+		N := findKthLargest(rf.matchIndex, rf.nPeers/2)
+		if rf.log[N].Term == rf.currentTerm {
+			rf.commitIndex = N
+		}
+
+		commitIndex := rf.commitIndex
+		currentTerm := rf.currentTerm
 		rf.UnLock()
 
 		for i := 0; i < rf.nPeers; i++ {
@@ -248,38 +303,63 @@ func (rf *Raft) goLeaderHeartbeat() {
 				go func(server int) {
 
 					rf.Lock()
+
 					preLogIndex := rf.nextIndex[server] - 1
 					preLogTerm := rf.log[preLogIndex].Term
-					commitIndex := rf.commitIndex
-					currentTerm := rf.currentTerm
+
+					entries := make([]Entry, 0, 10)
+					if len(rf.log)-1 >= rf.nextIndex[server] {
+						for j := rf.nextIndex[server]; j <= len(rf.log)-1; j++ {
+							entries = append(entries, rf.log[j])
+						}
+					}
+
 					rf.UnLock()
 
-					rf.callToAppendEntries(server, currentTerm, rf.me, preLogIndex, preLogTerm, commitIndex, nil)
+					rf.callToAppendEntries(server, currentTerm, rf.me, preLogIndex, preLogTerm, commitIndex, entries)
 
 				}(i)
 			}
 		}
 
-		time.Sleep(time.Duration(HeartbeatTimeout) * time.Millisecond)
+		<-rf.heartTimer.C
+		rf.Lock()
+		rf.ResetHeartTimer()
+		rf.UnLock()
 
 	}
 }
 
-func (rf *Raft) TurnToLeader() {
-	rf.Lock()
-	log.Printf("[Term %v]: [Node %v][Role %v] turn to Leader.\n", rf.currentTerm, rf.me, rf.role)
-	if rf.role != Candidate {
-		log.Panicf("[Node %d] role should be Candidate when turn to leader.\n", rf.me)
+func (rf *Raft) applyLoop() {
+	for {
+		if rf.killed() {
+			break
+		}
+		time.Sleep(time.Duration(ApplyTimeout) * time.Millisecond)
+		rf.Lock()
+		for rf.commitIndex > rf.lastApplied {
+			rf.lastApplied += 1
+			entry := rf.log[rf.lastApplied]
+			applyMsg := ApplyMsg{
+				CommandValid: true,
+				Command:      entry.Command,
+				CommandIndex: rf.lastApplied,
+			}
+			log.Printf("[Term %v]: [Node %v][Role %v] commitIndex: %v, lastApplied: %v, apply command %v.\n",
+				rf.currentTerm, rf.me, rf.role, rf.commitIndex, rf.lastApplied, entry.Command)
+			rf.applyCh <- applyMsg
+		}
+		rf.UnLock()
 	}
-	rf.role = Leader
-	for i := 0; i < rf.nPeers; i++ {
-		rf.nextIndex[i] = len(rf.log)
-		rf.matchIndex[i] = 0
+}
+
+// The ticker go routine starts a new election if this peer hasn't received
+// heartsbeats recently.
+func (rf *Raft) electLoop() {
+	for !rf.killed() {
+		<-rf.electTimer.C
+		rf.TurnToCandidate()
 	}
-	rf.UnLock()
-
-	go rf.goLeaderHeartbeat()
-
 }
 
 // return currentTerm and whether this server
@@ -453,7 +533,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			reply.VoteGranted = true
 			log.Printf("[Term %v]: [Node %v][Role %v] receive request from %v, vote to it.\n",
 				rf.currentTerm, rf.me, rf.role, args.CandidateId)
-			rf.ResetPeriodTimer()
+			rf.ResetElectTimer()
 
 		} else {
 			reply.VoteGranted = false
@@ -522,6 +602,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 				idx += 1
 				rf.log[idx] = entry
 			}
+			log.Printf("LeaderCommit %v, index of last new entry %v\n", args.LeaderCommit, idx)
 			if args.LeaderCommit > rf.commitIndex {
 				if args.LeaderCommit < idx {
 					rf.commitIndex = args.LeaderCommit
@@ -530,9 +611,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 				}
 			}
 			reply.Success = true
-			log.Printf("[Term %v]: [Node %v][Role %v] receive request from %v, reset timer.\n",
-				rf.currentTerm, rf.me, rf.role, args.LeaderId)
-			rf.ResetPeriodTimer()
+			log.Printf("[Term %v]: [Node %v][Role %v][CommitIndex %v] receive request from %v, reset timer.\n",
+				rf.currentTerm, rf.me, rf.role, rf.commitIndex, args.LeaderId)
+			rf.ResetElectTimer()
 
 		}
 	}
@@ -598,6 +679,21 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	isLeader := true
 
 	// Your code here (2B).
+	rf.Lock()
+	term = rf.currentTerm
+	isLeader = rf.role == Leader
+
+	if isLeader {
+		log.Printf("[Term %v]: [Node %v][Role %v] client request to add %v.\n",
+			rf.currentTerm, rf.me, rf.role, command)
+
+		nextIndex := rf.nextIndex[rf.me]
+		rf.log[nextIndex] = Entry{command, rf.currentTerm}
+		rf.nextIndex[rf.me] += 1
+
+	}
+	index = len(rf.log) - 1
+	rf.UnLock()
 
 	return index, term, isLeader
 }
@@ -621,20 +717,6 @@ func (rf *Raft) Kill() {
 func (rf *Raft) killed() bool {
 	z := atomic.LoadInt32(&rf.dead)
 	return z == 1
-}
-
-// The ticker go routine starts a new election if this peer hasn't received
-// heartsbeats recently.
-func (rf *Raft) ticker() {
-	for rf.killed() == false {
-
-		// Your code here to check if a leader election should
-		// be started and to randomize sleeping time using
-		// time.Sleep().
-		<-rf.periodTimer.C
-		rf.TurnToCandidate()
-
-	}
 }
 
 //
@@ -677,11 +759,14 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	rand.Seed(time.Now().UnixNano())
 	d := rand.Int()%ElectionTimeout + ElectionTimeout
-	rf.periodTimer = time.NewTimer(time.Duration(d) * time.Millisecond)
+	rf.electTimer = time.NewTimer(time.Duration(d) * time.Millisecond)
+	rf.heartTimer = time.NewTimer(time.Duration(HeartbeatTimeout) * time.Microsecond)
 
 	log.Printf("[Init %v] set period timer to %v.\n", rf.me, d)
-	// start ticker goroutine to start elections
-	go rf.ticker()
+
+	// start goroutine to start elections
+	go rf.electLoop()
+	go rf.applyLoop()
 
 	return rf
 }

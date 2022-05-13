@@ -22,7 +22,6 @@ import "math/big"
 import "encoding/base64"
 import "time"
 import "fmt"
-import "os"
 
 func randstring(n int) string {
 	b := make([]byte, 2*n)
@@ -66,11 +65,11 @@ var ncpu_once sync.Once
 func make_config(t *testing.T, n int, unreliable bool, snapshot bool) *config {
 
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
-	logFile, err := os.OpenFile("/dev/null", os.O_APPEND, 0666)
-	if err != nil {
-		log.Fatalf("[Debug] open /dev/null file failed.")
-	}
-	log.SetOutput(logFile)
+	//logFile, err := os.OpenFile("/dev/null", os.O_APPEND, 0666)
+	//if err != nil {
+	//	log.Fatalf("[Debug] open /dev/null file failed.")
+	//}
+	//log.SetOutput(logFile)
 
 	ncpu_once.Do(func() {
 		if runtime.NumCPU() < 2 {
@@ -169,6 +168,9 @@ func (cfg *config) checkLogs(i int, m ApplyMsg) (string, bool) {
 // contents
 func (cfg *config) applier(i int, applyCh chan ApplyMsg) {
 	for m := range applyCh {
+
+		log.Printf("[Debug] Node %v receive apply: %v\n", i, m)
+
 		if m.CommandValid == false {
 			// ignore other types of ApplyMsg
 		} else {
@@ -605,6 +607,7 @@ func (cfg *config) one(cmd interface{}, expectedServers int, retry bool) int {
 				nd, cmd1 := cfg.nCommitted(index)
 				if nd > 0 && nd >= expectedServers {
 					// committed
+					log.Printf("[Debug] cfg.nCommitted, count %v, cmd1 %v, cmd %v.\n", nd, cmd1, cmd)
 					if cmd1 == cmd {
 						// and it was the command we submitted.
 						return index
